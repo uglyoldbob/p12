@@ -521,6 +521,18 @@ impl PFX {
     pub fn to_der(&self) -> Vec<u8> {
         yasna::construct_der(|w| self.write(w))
     }
+
+    pub fn safe_bags(&self, password: &str) -> Result<Vec<SafeBag>, ASN1Error> {
+        let data = self.auth_safe.data(password.as_bytes()).unwrap();
+        let safe_bags = yasna::parse_ber(&data, |r| r.collect_sequence_of(SafeBag::parse))?;
+
+        let mut result = vec![];
+        for safe_bag in safe_bags.iter() {
+            result.push(safe_bag.to_owned())
+        }
+        Ok(result)
+    }
+
     pub fn bags(&self, password: &str) -> Result<Vec<SafeBag>, ASN1Error> {
         let password = bmp_string(password);
 
@@ -846,6 +858,14 @@ impl SafeBagKind {
         let bag_value = r.read_der()?;
         Ok(SafeBagKind::OtherBagKind(OtherBag { bag_id, bag_value }))
     }
+
+    pub fn other_bag_data(&self) -> Option<Vec<u8>> {
+        if let SafeBagKind::OtherBagKind(ob) = self {
+            return Some(ob.bag_value.to_owned());
+        }
+        None
+    }
+
     pub fn write(&self, w: DERWriter) {
         match self {
             SafeBagKind::Pkcs8ShroudedKeyBag(epk) => epk.write(w),
