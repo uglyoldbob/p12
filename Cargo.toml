@@ -30,7 +30,7 @@ features = ["alloc", "block-padding"]
 [dependencies.yasna]
 version = "0.5.2"
 git = "https://github.com/uglyoldbob/yasna.rs"
-features = ["std"]
+features = ["std", "num-bigint"]
 
 [dev-dependencies]
 hex = "^0.4.2"
