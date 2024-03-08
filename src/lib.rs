@@ -5,6 +5,9 @@
 
 use getrandom::getrandom;
 use lazy_static::lazy_static;
+
+pub use yasna;
+
 use yasna::{models::ObjectIdentifier, ASN1Error, ASN1ErrorKind, BERReader, DERWriter, Tag};
 
 use hmac::{Hmac, Mac};
