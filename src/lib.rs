@@ -581,25 +581,25 @@ impl PFX {
         hmac: HmacMethod,
     ) -> Option<PFX> {
         println!("Building with {:?}", algorithm);
-        let password = bmp_string(password);
-        let encrypted_data = match &algorithm {
+        let (password, encrypted_data) = match &algorithm {
             AlgorithmIdentifier::Pbe2(params) => {
                 let scheme = pkcs5::EncryptionScheme::Pbes2(params.get_parameters());
                 let encrypted_data = scheme.encrypt(&password, key_der).unwrap();
-                encrypted_data
+                (password.as_bytes().to_vec(), encrypted_data)
             }
             AlgorithmIdentifier::Sha1 => todo!(),
             AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(_) => {
                 todo!()
             }
             AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(param) => {
+                let password = bmp_string(password);
                 let encrypted_data = pbe_with_sha_and3_key_triple_des_cbc_encrypt(
                     key_der,
                     &password,
                     &param.salt,
                     param.iterations,
                 )?;
-                encrypted_data
+                (password, encrypted_data)
             }
             AlgorithmIdentifier::OtherAlg(_) => todo!(),
         };
