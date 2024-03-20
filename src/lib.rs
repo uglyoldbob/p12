@@ -12,8 +12,32 @@ use yasna::{models::ObjectIdentifier, ASN1Error, ASN1ErrorKind, BERReader, DERWr
 
 use hmac::{Hmac, Mac};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 
 type HmacSha1 = Hmac<Sha1>;
+type HmacSha256 = Hmac<Sha256>;
+
+pub enum HmacMethod {
+    Sha1,
+    Sha256,
+}
+
+impl HmacMethod {
+    fn hash(&self, bytes: &[u8]) -> Vec<u8> {
+        match self {
+            HmacMethod::Sha1 => {
+                let mut hasher = Sha1::new();
+                hasher.update(bytes);
+                hasher.finalize().to_vec()
+            }
+            HmacMethod::Sha256 => {
+                let mut hasher = Sha256::new();
+                hasher.update(bytes);
+                hasher.finalize().to_vec()
+            }
+        }
+    }
+}
 
 fn as_oid(s: &'static [u64]) -> ObjectIdentifier {
     ObjectIdentifier::from_slice(s)
@@ -45,12 +69,6 @@ lazy_static! {
 }
 
 const ITERATIONS: u64 = 2048;
-
-fn sha1(bytes: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha1::new();
-    hasher.update(bytes);
-    hasher.finalize().to_vec()
-}
 
 #[derive(Debug, Clone)]
 pub struct EncryptedContentInfo {
@@ -92,7 +110,11 @@ impl EncryptedContentInfo {
         yasna::construct_der(|w| self.write(w))
     }
 
-    pub fn from_safe_bags(safe_bags: &[SafeBag], password: &[u8]) -> Option<EncryptedContentInfo> {
+    pub fn from_safe_bags(
+        safe_bags: &[SafeBag],
+        password: &[u8],
+        alg: AlgorithmIdentifier,
+    ) -> Option<EncryptedContentInfo> {
         let data = yasna::construct_der(|w| {
             w.write_sequence_of(|w| {
                 for sb in safe_bags {
@@ -100,16 +122,9 @@ impl EncryptedContentInfo {
                 }
             })
         });
-        let salt = rand()?.to_vec();
-        let encrypted_content =
-            pbe_with_sha1_and40_bit_rc2_cbc_encrypt(&data, password, &salt, ITERATIONS)?;
-        let content_encryption_algorithm =
-            AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(Pkcs12PbeParams {
-                salt,
-                iterations: ITERATIONS,
-            });
+        let encrypted_content = alg.encrypt(&data, password);
         Some(EncryptedContentInfo {
-            content_encryption_algorithm,
+            content_encryption_algorithm: alg,
             encrypted_content,
         })
     }
@@ -141,8 +156,13 @@ impl EncryptedData {
             self.encrypted_content_info.write(w.next());
         })
     }
-    pub fn from_safe_bags(safe_bags: &[SafeBag], password: &[u8]) -> Option<Self> {
-        let encrypted_content_info = EncryptedContentInfo::from_safe_bags(safe_bags, password)?;
+    pub fn from_safe_bags(
+        safe_bags: &[SafeBag],
+        password: &[u8],
+        alg: AlgorithmIdentifier,
+    ) -> Option<Self> {
+        let encrypted_content_info =
+            EncryptedContentInfo::from_safe_bags(safe_bags, password, alg)?;
         Some(EncryptedData {
             encrypted_content_info,
         })
@@ -254,11 +274,49 @@ pub struct OtherAlgorithmIdentifier {
     pub params: Option<Vec<u8>>,
 }
 
+fn convert_pkcs5_oid_to_yasna_oid(
+    oid: &pkcs5::ObjectIdentifier,
+) -> yasna::models::ObjectIdentifier {
+    use std::str::FromStr;
+    let oid_s = oid.to_string();
+    let oid_c = yasna::models::ObjectIdentifier::from_str(&oid_s).unwrap();
+    oid_c
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pbkdf2Params {
+    pub salt: Vec<u8>,
+    pub iteration_count: u32,
+    pub iv: [u8; 16],
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pbes2KdfParams {
+    Pbkdf2(Pbkdf2Params),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pbes2Parameters {
+    pub parameters: Pbes2KdfParams,
+}
+
+impl Pbes2Parameters {
+    fn get_parameters<'a>(&'a self) -> pkcs5::pbes2::Parameters<'a> {
+        match &self.parameters {
+            Pbes2KdfParams::Pbkdf2(p) => {
+                pkcs5::pbes2::Parameters::pbkdf2_sha256_aes256cbc(p.iteration_count, &p.salt, &p.iv)
+                    .unwrap()
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlgorithmIdentifier {
     Sha1,
     PbewithSHAAnd40BitRC2CBC(Pkcs12PbeParams),
     PbeWithSHAAnd3KeyTripleDESCBC(Pkcs12PbeParams),
+    Pbe2(Pbes2Parameters),
     OtherAlg(OtherAlgorithmIdentifier),
 }
 
@@ -287,6 +345,10 @@ impl AlgorithmIdentifier {
     }
     pub fn decrypt_pbe(&self, ciphertext: &[u8], password: &[u8]) -> Option<Vec<u8>> {
         match self {
+            AlgorithmIdentifier::Pbe2(param) => {
+                let scheme = pkcs5::EncryptionScheme::Pbes2(param.get_parameters());
+                scheme.decrypt(password, ciphertext).ok()
+            }
             AlgorithmIdentifier::Sha1 => None,
             AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(param) => {
                 pbe_with_sha1_and40_bit_rc2_cbc(ciphertext, password, &param.salt, param.iterations)
@@ -302,8 +364,80 @@ impl AlgorithmIdentifier {
             AlgorithmIdentifier::OtherAlg(_) => None,
         }
     }
+
+    pub fn encrypt(&self, data: &[u8], password: &[u8]) -> Vec<u8> {
+        match self {
+            AlgorithmIdentifier::Sha1 => todo!(),
+            AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(p) => {
+                let encrypted_content =
+                    pbe_with_sha1_and40_bit_rc2_cbc_encrypt(&data, password, &p.salt, p.iterations)
+                        .unwrap();
+                encrypted_content
+            }
+            AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(_) => todo!(),
+            AlgorithmIdentifier::Pbe2(p) => {
+                let p = p.get_parameters();
+                p.encrypt(password, data).unwrap()
+            }
+            AlgorithmIdentifier::OtherAlg(_) => todo!(),
+        }
+    }
+
     pub fn write(&self, w: DERWriter) {
+        println!("Writing algorithm {:?}", self);
         w.write_sequence(|w| match self {
+            AlgorithmIdentifier::Pbe2(params) => {
+                let p = params.get_parameters();
+                let oid_c = convert_pkcs5_oid_to_yasna_oid(&pkcs5::pbes2::PBES2_OID);
+                println!("Oid 1 is {:?}", oid_c);
+                w.next().write_oid(&oid_c);
+                w.next().write_sequence(|w| {
+                    w.next().write_sequence(|w| {
+                        //keyDerivationFunc
+                        let oid = convert_pkcs5_oid_to_yasna_oid(&p.kdf.oid());
+                        println!("Oid 2 is {:?}", oid);
+                        w.next().write_oid(&oid);
+                        match p.kdf {
+                            pkcs5::pbes2::Kdf::Pbkdf2(kdf) => {
+                                w.next().write_sequence(|w| {
+                                    //salt
+                                    w.next().write_bytes(kdf.salt);
+                                    //iterationcount
+                                    w.next().write_u32(kdf.iteration_count);
+                                    //keylength (optional)
+                                    if let Some(l) = kdf.key_length {
+                                        w.next().write_u16(l);
+                                    }
+                                    //prf
+                                    w.next().write_sequence(|w| {
+                                        let oid = convert_pkcs5_oid_to_yasna_oid(&kdf.prf.oid());
+                                        w.next().write_oid(&oid);
+                                        w.next().write_null();
+                                    });
+                                    //algid
+                                });
+                            }
+                            pkcs5::pbes2::Kdf::Scrypt(kdf) => todo!(),
+                            _ => todo!(),
+                        }
+                    });
+                    //encryptionScheme
+                    match p.encryption {
+                        pkcs5::pbes2::EncryptionScheme::Aes128Cbc { iv } => todo!(),
+                        pkcs5::pbes2::EncryptionScheme::Aes192Cbc { iv } => todo!(),
+                        pkcs5::pbes2::EncryptionScheme::Aes256Cbc { iv } => {
+                            w.next().write_sequence(|w| {
+                                let oid =
+                                    convert_pkcs5_oid_to_yasna_oid(&pkcs5::pbes2::AES_256_CBC_OID);
+                                println!("Oid 3 is {:?}", oid);
+                                w.next().write_oid(&oid);
+                                w.next().write_bytes(iv);
+                            });
+                        }
+                        _ => todo!(),
+                    }
+                });
+            }
             AlgorithmIdentifier::Sha1 => {
                 w.next().write_oid(&OID_SHA1);
                 w.next().write_null();
@@ -429,12 +563,13 @@ impl PFX {
         password: &str,
         name: &str,
         algorithm: AlgorithmIdentifier,
+        hmac: HmacMethod,
     ) -> Option<PFX> {
         let mut cas = vec![];
         if let Some(ca) = ca_der {
             cas.push(ca);
         }
-        Self::new_with_cas(cert_der, key_der, &cas, password, name, algorithm)
+        Self::new_with_cas(cert_der, key_der, &cas, password, name, algorithm, hmac)
     }
     pub fn new_with_cas(
         cert_der: &[u8],
@@ -443,31 +578,37 @@ impl PFX {
         password: &str,
         name: &str,
         algorithm: AlgorithmIdentifier,
+        hmac: HmacMethod,
     ) -> Option<PFX> {
-        let (password, algorithm, encrypted_data) = match algorithm {
+        println!("Building with {:?}", algorithm);
+        let password = bmp_string(password);
+        let encrypted_data = match &algorithm {
+            AlgorithmIdentifier::Pbe2(params) => {
+                let scheme = pkcs5::EncryptionScheme::Pbes2(params.get_parameters());
+                let encrypted_data = scheme.encrypt(&password, key_der).unwrap();
+                encrypted_data
+            }
             AlgorithmIdentifier::Sha1 => todo!(),
             AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(_) => {
-                let password = bmp_string(password);
-                let salt = rand()?.to_vec();
-                let encrypted_data = pbe_with_sha_and3_key_triple_des_cbc_encrypt(
-                    key_der, &password, &salt, ITERATIONS,
-                )?;
-                let param = Pkcs12PbeParams {
-                    salt,
-                    iterations: ITERATIONS,
-                };
-                let param = AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(param);
-                (password, param, encrypted_data)
+                todo!()
             }
-            AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(_) => todo!(),
+            AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(param) => {
+                let encrypted_data = pbe_with_sha_and3_key_triple_des_cbc_encrypt(
+                    key_der,
+                    &password,
+                    &param.salt,
+                    param.iterations,
+                )?;
+                encrypted_data
+            }
             AlgorithmIdentifier::OtherAlg(_) => todo!(),
         };
         let key_bag_inner = SafeBagKind::Pkcs8ShroudedKeyBag(EncryptedPrivateKeyInfo {
-            encryption_algorithm: algorithm,
+            encryption_algorithm: algorithm.clone(),
             encrypted_data,
         });
         let friendly_name = PKCS12Attribute::FriendlyName(name.to_owned());
-        let local_key_id = PKCS12Attribute::LocalKeyId(sha1(cert_der));
+        let local_key_id = PKCS12Attribute::LocalKeyId(hmac.hash(cert_der));
         let key_bag = SafeBag {
             bag: key_bag_inner,
             attributes: vec![friendly_name.clone(), local_key_id.clone()],
@@ -487,7 +628,7 @@ impl PFX {
         let contents = yasna::construct_der(|w| {
             w.write_sequence_of(|w| {
                 ContentInfo::EncryptedData(
-                    EncryptedData::from_safe_bags(&cert_bags, &password)
+                    EncryptedData::from_safe_bags(&cert_bags, &password, algorithm)
                         .ok_or_else(|| ASN1Error::new(ASN1ErrorKind::Invalid))
                         .unwrap(),
                 )
@@ -622,7 +763,7 @@ impl PFX {
 fn pbepkcs12sha1core(d: &[u8], i: &[u8], a: &mut Vec<u8>, iterations: u64) -> Vec<u8> {
     let mut ai: Vec<u8> = d.iter().chain(i.iter()).cloned().collect();
     for _ in 0..iterations {
-        ai = sha1(&ai);
+        ai = HmacMethod::Sha1.hash(&ai);
     }
     a.append(&mut ai.clone());
     ai
