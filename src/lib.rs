@@ -428,12 +428,13 @@ impl PFX {
         ca_der: Option<&[u8]>,
         password: &str,
         name: &str,
+        algorithm: AlgorithmIdentifier,
     ) -> Option<PFX> {
         let mut cas = vec![];
         if let Some(ca) = ca_der {
             cas.push(ca);
         }
-        Self::new_with_cas(cert_der, key_der, &cas, password, name)
+        Self::new_with_cas(cert_der, key_der, &cas, password, name, algorithm)
     }
     pub fn new_with_cas(
         cert_der: &[u8],
@@ -441,17 +442,28 @@ impl PFX {
         ca_der_list: &[&[u8]],
         password: &str,
         name: &str,
+        algorithm: AlgorithmIdentifier,
     ) -> Option<PFX> {
-        let password = bmp_string(password);
-        let salt = rand()?.to_vec();
-        let encrypted_data =
-            pbe_with_sha_and3_key_triple_des_cbc_encrypt(key_der, &password, &salt, ITERATIONS)?;
-        let param = Pkcs12PbeParams {
-            salt,
-            iterations: ITERATIONS,
+        let (password, algorithm, encrypted_data) = match algorithm {
+            AlgorithmIdentifier::Sha1 => todo!(),
+            AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(_) => {
+                let password = bmp_string(password);
+                let salt = rand()?.to_vec();
+                let encrypted_data = pbe_with_sha_and3_key_triple_des_cbc_encrypt(
+                    key_der, &password, &salt, ITERATIONS,
+                )?;
+                let param = Pkcs12PbeParams {
+                    salt,
+                    iterations: ITERATIONS,
+                };
+                let param = AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(param);
+                (password, param, encrypted_data)
+            }
+            AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(_) => todo!(),
+            AlgorithmIdentifier::OtherAlg(_) => todo!(),
         };
         let key_bag_inner = SafeBagKind::Pkcs8ShroudedKeyBag(EncryptedPrivateKeyInfo {
-            encryption_algorithm: AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(param),
+            encryption_algorithm: algorithm,
             encrypted_data,
         });
         let friendly_name = PKCS12Attribute::FriendlyName(name.to_owned());
