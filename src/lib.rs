@@ -49,6 +49,13 @@ pub enum HmacMethod {
 }
 
 impl HmacMethod {
+    fn get_algorithm(&self) -> AlgorithmIdentifier {
+        match self {
+            Self::Sha1 => AlgorithmIdentifier::Sha1,
+            Self::Sha256 => AlgorithmIdentifier::Sha256,
+        }
+    }
+
     fn from_oid(oid: ObjectIdentifier) -> Option<Self> {
         if oid == OID_HMAC_SHA256.to_owned() {
             Some(HmacMethod::Sha256)
@@ -709,12 +716,7 @@ impl MacData {
         mac.verify_slice(&self.mac.digest).is_ok()
     }
 
-    pub fn new(
-        data: &[u8],
-        password: &[u8],
-        alg: AlgorithmIdentifier,
-        hmac: HmacMethod,
-    ) -> MacData {
+    pub fn new(data: &[u8], password: &[u8], hmac: HmacMethod) -> MacData {
         let (mac, salt) = match hmac {
             HmacMethod::Sha1 => {
                 let salt = rand().unwrap();
@@ -724,26 +726,13 @@ impl MacData {
                 (mac, salt.to_vec())
             }
             HmacMethod::Sha256 => {
-                if let AlgorithmIdentifier::Pbe2(p) = &alg {
-                    let param = p.get_parameters();
-                    let salt = match param.kdf {
-                        pkcs5::pbes2::Kdf::Pbkdf2(p) => p.salt,
-                        pkcs5::pbes2::Kdf::Scrypt(p) => p.salt,
-                        _ => todo!(),
-                    };
-                    let key = param.encrypt(password, data).unwrap();
-                    let mut mac: HmacEnum = hmac.new_from_slice(&key);
-                    mac.update(data);
-                    (mac, salt.to_vec())
-                } else {
-                    todo!();
-                }
+                todo!();
             }
         };
         let digest = mac.get_digest();
         MacData {
             mac: DigestInfo {
-                digest_algorithm: alg,
+                digest_algorithm: hmac.get_algorithm(),
                 digest,
             },
             salt,
@@ -868,7 +857,7 @@ impl PFX {
                 .write(w.next());
             });
         });
-        let mac_data = MacData::new(&contents, &password, algorithm, hmac);
+        let mac_data = MacData::new(&contents, &password, hmac);
         Some(PFX {
             version: 3,
             auth_safe: ContentInfo::Data(contents),
