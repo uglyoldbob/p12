@@ -17,12 +17,66 @@ use sha2::Sha256;
 type HmacSha1 = Hmac<Sha1>;
 type HmacSha256 = Hmac<Sha256>;
 
+pub enum HmacEnum {
+    Sha1(HmacSha1),
+    Sha256(HmacSha256),
+}
+
+impl HmacEnum {
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            HmacEnum::Sha1(hmac) => {
+                hmac.update(data);
+            }
+            HmacEnum::Sha256(hmac) => {
+                hmac.update(data);
+            }
+        }
+    }
+
+    fn get_digest(self) -> Vec<u8> {
+        match self {
+            HmacEnum::Sha1(hmac) => hmac.finalize().into_bytes().to_vec(),
+            HmacEnum::Sha256(hmac) => hmac.finalize().into_bytes().to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum HmacMethod {
     Sha1,
     Sha256,
 }
 
 impl HmacMethod {
+    fn from_oid(oid: ObjectIdentifier) -> Option<Self> {
+        if oid == OID_HMAC_SHA256.to_owned() {
+            Some(HmacMethod::Sha256)
+        } else {
+            None
+        }
+    }
+
+    fn oid(&self) -> yasna::models::ObjectIdentifier {
+        match self {
+            HmacMethod::Sha1 => todo!(),
+            HmacMethod::Sha256 => OID_HMAC_SHA256.to_owned(),
+        }
+    }
+
+    fn new_from_slice(&self, key: &[u8]) -> HmacEnum {
+        match self {
+            HmacMethod::Sha1 => {
+                let h = HmacSha1::new_from_slice(key).unwrap();
+                HmacEnum::Sha1(h)
+            }
+            HmacMethod::Sha256 => {
+                let h = HmacSha256::new_from_slice(key).unwrap();
+                HmacEnum::Sha256(h)
+            }
+        }
+    }
+
     fn hash(&self, bytes: &[u8]) -> Vec<u8> {
         match self {
             HmacMethod::Sha1 => {
@@ -56,8 +110,10 @@ lazy_static! {
     static ref OID_PBE_WITH_SHA_AND3_KEY_TRIPLE_DESCBC: ObjectIdentifier =
         as_oid(&[1, 2, 840, 113_549, 1, 12, 1, 3]);
     static ref OID_SHA1: ObjectIdentifier = as_oid(&[1, 3, 14, 3, 2, 26]);
+    static ref OID_SHA256: ObjectIdentifier = as_oid(&[2, 16, 840, 1, 101, 3, 4, 2, 1]);
     static ref OID_PBE_WITH_SHA1_AND40_BIT_RC2_CBC: ObjectIdentifier =
         as_oid(&[1, 2, 840, 113_549, 1, 12, 1, 6]);
+    static ref OID_PBES2: ObjectIdentifier = as_oid(&[1, 2, 840, 113549, 1, 5, 13]);
     static ref OID_KEY_BAG: ObjectIdentifier = as_oid(&[1, 2, 840, 113_549, 1, 12, 10, 1, 1]);
     static ref OID_PKCS8_SHROUDED_KEY_BAG: ObjectIdentifier =
         as_oid(&[1, 2, 840, 113_549, 1, 12, 10, 1, 2]);
@@ -66,6 +122,7 @@ lazy_static! {
     static ref OID_SECRET_BAG: ObjectIdentifier = as_oid(&[1, 2, 840, 113_549, 1, 12, 10, 1, 5]);
     static ref OID_SAFE_CONTENTS_BAG: ObjectIdentifier =
         as_oid(&[1, 2, 840, 113_549, 1, 12, 10, 1, 6]);
+    static ref OID_HMAC_SHA256: ObjectIdentifier = as_oid(&[1, 2, 840, 113_549, 2, 9]);
 }
 
 const ITERATIONS: u64 = 2048;
@@ -290,9 +347,30 @@ pub struct Pbkdf2Params {
     pub iv: [u8; 16],
 }
 
+impl Pbkdf2Params {
+    fn get_parameters<'a>(&'a self) -> pkcs5::pbes2::Parameters<'a> {
+        pkcs5::pbes2::Parameters::pbkdf2_sha256_aes256cbc(
+            self.iteration_count,
+            &self.salt,
+            &self.iv,
+        )
+        .unwrap()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pbes2KdfParams {
-    Pbkdf2(Pbkdf2Params),
+    Pbkdf2(Pbkdf2Params, HmacMethod),
+}
+
+impl Pbes2KdfParams {
+    fn get_algorithm(&self) -> AlgorithmIdentifier {
+        match self {
+            Self::Pbkdf2(params, hmac) => {
+                AlgorithmIdentifier::Pbkdf2(params.to_owned(), hmac.to_owned())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -301,29 +379,57 @@ pub struct Pbes2Parameters {
 }
 
 impl Pbes2Parameters {
-    fn get_parameters<'a>(&'a self) -> pkcs5::pbes2::Parameters<'a> {
+    pub fn get_parameters<'a>(&'a self) -> pkcs5::pbes2::Parameters<'a> {
         match &self.parameters {
-            Pbes2KdfParams::Pbkdf2(p) => {
-                pkcs5::pbes2::Parameters::pbkdf2_sha256_aes256cbc(p.iteration_count, &p.salt, &p.iv)
-                    .unwrap()
-            }
+            Pbes2KdfParams::Pbkdf2(p, _hmac) => p.get_parameters(),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum AlgorithmKind {
+    Sha1,
+    PbewithSHAAnd40BitRC2CBC,
+    PbeWithSHAAnd3KeyTripleDESCBC,
+    Pbe2,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum AlgorithmIdentifier {
     Sha1,
+    Aes256Cbc(Vec<u8>), //The iv
+    Sha256,
+    Pbkdf2(Pbkdf2Params, HmacMethod),
     PbewithSHAAnd40BitRC2CBC(Pkcs12PbeParams),
     PbeWithSHAAnd3KeyTripleDESCBC(Pkcs12PbeParams),
     Pbe2(Pbes2Parameters),
+    Pbkdf2Prf(HmacMethod),
     OtherAlg(OtherAlgorithmIdentifier),
+}
+
+impl From<pkcs5::pbes2::Pbkdf2Prf> for AlgorithmIdentifier {
+    fn from(value: pkcs5::pbes2::Pbkdf2Prf) -> Self {
+        match value {
+            pkcs5::pbes2::Pbkdf2Prf::HmacWithSha1 => {
+                AlgorithmIdentifier::Pbkdf2Prf(HmacMethod::Sha1)
+            }
+            pkcs5::pbes2::Pbkdf2Prf::HmacWithSha224 => todo!(),
+            pkcs5::pbes2::Pbkdf2Prf::HmacWithSha256 => {
+                AlgorithmIdentifier::Pbkdf2Prf(HmacMethod::Sha256)
+            }
+            pkcs5::pbes2::Pbkdf2Prf::HmacWithSha384 => todo!(),
+            pkcs5::pbes2::Pbkdf2Prf::HmacWithSha512 => todo!(),
+            _ => todo!(),
+        }
+    }
 }
 
 impl AlgorithmIdentifier {
     pub fn parse(r: BERReader) -> Result<Self, ASN1Error> {
+        let t = r.lookahead_tag();
         r.read_sequence(|r| {
-            let algorithm_type = r.next().read_oid()?;
+            let algorithm_type = r.next().read_oid().expect("Failed to read algorithm type");
+            println!("AlgorithmIdentifier found a {:?}", algorithm_type);
             if algorithm_type == *OID_SHA1 {
                 r.read_optional(|r| r.read_null())?;
                 return Ok(AlgorithmIdentifier::Sha1);
@@ -336,6 +442,78 @@ impl AlgorithmIdentifier {
                 let params = Pkcs12PbeParams::parse(r.next())?;
                 return Ok(AlgorithmIdentifier::PbeWithSHAAnd3KeyTripleDESCBC(params));
             }
+            if algorithm_type == *OID_SHA256 {
+                r.read_optional(|r| r.read_null())?;
+                return Ok(AlgorithmIdentifier::Sha256);
+            }
+            if algorithm_type == *OID_PBES2 {
+                println!("Attempting to decode pbes2 parameters");
+                let (kdf, enc) = r.next().read_sequence(|r| {
+                    let kdf = AlgorithmIdentifier::parse(r.next()).expect("Failed kdf");
+                    let enc = AlgorithmIdentifier::parse(r.next()).expect("Failed enc");
+                    Ok((kdf, enc))
+                })?;
+                println!("kdf: {:?}", kdf);
+                println!("enc: {:?}", enc);
+                let cp1 = if let AlgorithmIdentifier::Pbkdf2(p, hmac) = kdf {
+                    Some((p, hmac))
+                } else {
+                    None
+                };
+                let (params1, hmac) = cp1.unwrap();
+                let params2 = if let AlgorithmIdentifier::Pbkdf2(p, hmac) = enc {
+                    Some(p)
+                } else {
+                    None
+                };
+                let params2 = params2.unwrap();
+                let final_params = Pbkdf2Params {
+                    salt: params1.salt,
+                    iteration_count: params1.iteration_count,
+                    iv: params2.iv,
+                };
+                println!("final params: {:?}", final_params);
+                let params = Pbes2Parameters {
+                    parameters: Pbes2KdfParams::Pbkdf2(final_params, hmac),
+                };
+                return Ok(AlgorithmIdentifier::Pbe2(params));
+            }
+            if algorithm_type == convert_pkcs5_oid_to_yasna_oid(&pkcs5::pbes2::PBKDF2_OID) {
+                let (salt, iterations, hmac) = r.next().read_sequence(|r| {
+                    let salt = r.next().read_bytes()?;
+                    let iterations = r.next().read_u32()?;
+                    let hmac = r.next().read_sequence(|r| {
+                        let oid = r.next().read_oid()?;
+                        println!("OID D IS {:?}", oid);
+                        let hmac = HmacMethod::from_oid(oid).unwrap();
+                        r.next().read_null()?;
+                        println!("HMAC IS {:?}", hmac);
+                        Ok(hmac)
+                    })?;
+
+                    Ok((salt, iterations, hmac))
+                })?;
+                let params = Pbkdf2Params {
+                    salt,
+                    iteration_count: iterations,
+                    iv: [0; 16], //fake
+                };
+                println!("Done doing pbkdf2 oid");
+                return Ok(AlgorithmIdentifier::Pbkdf2(params, hmac));
+            }
+            if algorithm_type == convert_pkcs5_oid_to_yasna_oid(&pkcs5::pbes2::AES_256_CBC_OID) {
+                let iv = r.next().read_bytes()?;
+                let mut miv = [0; 16];
+                miv.copy_from_slice(&iv);
+                let params = Pbkdf2Params {
+                    salt: Vec::new(),   //fake
+                    iteration_count: 0, //fake
+                    iv: miv,
+                };
+                println!("Done doing pbkdf2 oid");
+                return Ok(AlgorithmIdentifier::Pbkdf2(params, HmacMethod::Sha1));
+            }
+            panic!("Unknown algorithm type {:?}", algorithm_type);
             let params = r.read_optional(|r| r.read_der())?;
             Ok(AlgorithmIdentifier::OtherAlg(OtherAlgorithmIdentifier {
                 algorithm_type,
@@ -345,10 +523,18 @@ impl AlgorithmIdentifier {
     }
     pub fn decrypt_pbe(&self, ciphertext: &[u8], password: &[u8]) -> Option<Vec<u8>> {
         match self {
+            AlgorithmIdentifier::Pbkdf2Prf(_params) => todo!(),
+            AlgorithmIdentifier::Aes256Cbc(_iv) => {
+                todo!()
+            }
+            AlgorithmIdentifier::Pbkdf2(params, hmac) => {
+                todo!()
+            }
             AlgorithmIdentifier::Pbe2(param) => {
                 let scheme = pkcs5::EncryptionScheme::Pbes2(param.get_parameters());
                 scheme.decrypt(password, ciphertext).ok()
             }
+            AlgorithmIdentifier::Sha256 => None,
             AlgorithmIdentifier::Sha1 => None,
             AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(param) => {
                 pbe_with_sha1_and40_bit_rc2_cbc(ciphertext, password, &param.salt, param.iterations)
@@ -367,7 +553,11 @@ impl AlgorithmIdentifier {
 
     pub fn encrypt(&self, data: &[u8], password: &[u8]) -> Vec<u8> {
         match self {
+            AlgorithmIdentifier::Pbkdf2Prf(_params) => todo!(),
             AlgorithmIdentifier::Sha1 => todo!(),
+            AlgorithmIdentifier::Sha256 => todo!(),
+            AlgorithmIdentifier::Aes256Cbc(_iv) => todo!(),
+            AlgorithmIdentifier::Pbkdf2(_params, _hmac) => todo!(),
             AlgorithmIdentifier::PbewithSHAAnd40BitRC2CBC(p) => {
                 let encrypted_content =
                     pbe_with_sha1_and40_bit_rc2_cbc_encrypt(&data, password, &p.salt, p.iterations)
@@ -386,56 +576,53 @@ impl AlgorithmIdentifier {
     pub fn write(&self, w: DERWriter) {
         println!("Writing algorithm {:?}", self);
         w.write_sequence(|w| match self {
+            AlgorithmIdentifier::Pbkdf2Prf(param) => {
+                w.next().write_oid(&param.oid());
+                w.next().write_null();
+            }
+            AlgorithmIdentifier::Sha256 => {
+                w.next().write_oid(&OID_SHA256);
+                w.next().write_null();
+            }
+            AlgorithmIdentifier::Pbkdf2(params, hmac) => {
+                let params = params.get_parameters();
+                let kdf2 = params.kdf.pbkdf2().unwrap();
+                let oid = pkcs5::pbes2::PBKDF2_OID;
+                let oid = convert_pkcs5_oid_to_yasna_oid(&oid);
+                println!("OID a is {:?}", oid);
+                w.next().write_oid(&oid);
+                w.next().write_sequence(|w| {
+                    w.next().write_bytes(&kdf2.salt);
+                    w.next().write_u32(kdf2.iteration_count);
+                    if let Some(t) = kdf2.key_length {
+                        w.next().write_u16(t);
+                    }
+                    let prf: AlgorithmIdentifier = kdf2.prf.into();
+                    prf.write(w.next());
+                });
+            }
+            AlgorithmIdentifier::Aes256Cbc(iv) => {
+                let oid = convert_pkcs5_oid_to_yasna_oid(&pkcs5::pbes2::AES_256_CBC_OID);
+                w.next().write_oid(&oid);
+                w.next().write_bytes(&iv);
+            }
             AlgorithmIdentifier::Pbe2(params) => {
-                let p = params.get_parameters();
                 let oid_c = convert_pkcs5_oid_to_yasna_oid(&pkcs5::pbes2::PBES2_OID);
                 println!("Oid 1 is {:?}", oid_c);
                 w.next().write_oid(&oid_c);
                 w.next().write_sequence(|w| {
-                    w.next().write_sequence(|w| {
-                        //keyDerivationFunc
-                        let oid = convert_pkcs5_oid_to_yasna_oid(&p.kdf.oid());
-                        println!("Oid 2 is {:?}", oid);
-                        w.next().write_oid(&oid);
-                        match p.kdf {
-                            pkcs5::pbes2::Kdf::Pbkdf2(kdf) => {
-                                w.next().write_sequence(|w| {
-                                    //salt
-                                    w.next().write_bytes(kdf.salt);
-                                    //iterationcount
-                                    w.next().write_u32(kdf.iteration_count);
-                                    //keylength (optional)
-                                    if let Some(l) = kdf.key_length {
-                                        w.next().write_u16(l);
-                                    }
-                                    //prf
-                                    w.next().write_sequence(|w| {
-                                        let oid = convert_pkcs5_oid_to_yasna_oid(&kdf.prf.oid());
-                                        w.next().write_oid(&oid);
-                                        w.next().write_null();
-                                    });
-                                    //algid
-                                });
-                            }
-                            pkcs5::pbes2::Kdf::Scrypt(kdf) => todo!(),
-                            _ => todo!(),
-                        }
-                    });
+                    //keyDerivationFunc
+                    let kdf = params.parameters.get_algorithm();
+                    let cp1 = if let AlgorithmIdentifier::Pbkdf2(p, _hmac) = &kdf {
+                        Some(p)
+                    } else {
+                        None
+                    };
+                    let params1 = cp1.unwrap();
+                    kdf.write(w.next());
                     //encryptionScheme
-                    match p.encryption {
-                        pkcs5::pbes2::EncryptionScheme::Aes128Cbc { iv } => todo!(),
-                        pkcs5::pbes2::EncryptionScheme::Aes192Cbc { iv } => todo!(),
-                        pkcs5::pbes2::EncryptionScheme::Aes256Cbc { iv } => {
-                            w.next().write_sequence(|w| {
-                                let oid =
-                                    convert_pkcs5_oid_to_yasna_oid(&pkcs5::pbes2::AES_256_CBC_OID);
-                                println!("Oid 3 is {:?}", oid);
-                                w.next().write_oid(&oid);
-                                w.next().write_bytes(iv);
-                            });
-                        }
-                        _ => todo!(),
-                    }
+                    let encs = AlgorithmIdentifier::Aes256Cbc(params1.iv.to_vec());
+                    encs.write(w.next());
                 });
             }
             AlgorithmIdentifier::Sha1 => {
@@ -522,18 +709,44 @@ impl MacData {
         mac.verify_slice(&self.mac.digest).is_ok()
     }
 
-    pub fn new(data: &[u8], password: &[u8]) -> MacData {
-        let salt = rand().unwrap();
-        let key = pbepkcs12sha1(password, &salt, ITERATIONS, 3, 20);
-        let mut mac = HmacSha1::new_from_slice(&key).unwrap();
-        mac.update(data);
-        let digest = mac.finalize().into_bytes().to_vec();
+    pub fn new(
+        data: &[u8],
+        password: &[u8],
+        alg: AlgorithmIdentifier,
+        hmac: HmacMethod,
+    ) -> MacData {
+        let (mac, salt) = match hmac {
+            HmacMethod::Sha1 => {
+                let salt = rand().unwrap();
+                let key = pbepkcs12sha1(password, &salt, ITERATIONS, 3, 20);
+                let mut mac: HmacEnum = hmac.new_from_slice(&key);
+                mac.update(data);
+                (mac, salt.to_vec())
+            }
+            HmacMethod::Sha256 => {
+                if let AlgorithmIdentifier::Pbe2(p) = &alg {
+                    let param = p.get_parameters();
+                    let salt = match param.kdf {
+                        pkcs5::pbes2::Kdf::Pbkdf2(p) => p.salt,
+                        pkcs5::pbes2::Kdf::Scrypt(p) => p.salt,
+                        _ => todo!(),
+                    };
+                    let key = param.encrypt(password, data).unwrap();
+                    let mut mac: HmacEnum = hmac.new_from_slice(&key);
+                    mac.update(data);
+                    (mac, salt.to_vec())
+                } else {
+                    todo!();
+                }
+            }
+        };
+        let digest = mac.get_digest();
         MacData {
             mac: DigestInfo {
-                digest_algorithm: AlgorithmIdentifier::Sha1,
+                digest_algorithm: alg,
                 digest,
             },
-            salt: salt.to_vec(),
+            salt,
             iterations: ITERATIONS as u32,
         }
     }
@@ -582,6 +795,18 @@ impl PFX {
     ) -> Option<PFX> {
         println!("Building with {:?}", algorithm);
         let (password, encrypted_data) = match &algorithm {
+            AlgorithmIdentifier::Pbkdf2Prf(_) => {
+                todo!();
+            }
+            AlgorithmIdentifier::Aes256Cbc(_iv) => {
+                todo!();
+            }
+            AlgorithmIdentifier::Pbkdf2(params, hmac) => {
+                todo!();
+            }
+            AlgorithmIdentifier::Sha256 => {
+                todo!();
+            }
             AlgorithmIdentifier::Pbe2(params) => {
                 let scheme = pkcs5::EncryptionScheme::Pbes2(params.get_parameters());
                 let encrypted_data = scheme.encrypt(&password, key_der).unwrap();
@@ -625,10 +850,12 @@ impl PFX {
                 attributes: vec![],
             });
         }
+
+        let alg = algorithm.clone();
         let contents = yasna::construct_der(|w| {
             w.write_sequence_of(|w| {
                 ContentInfo::EncryptedData(
-                    EncryptedData::from_safe_bags(&cert_bags, &password, algorithm)
+                    EncryptedData::from_safe_bags(&cert_bags, &password, alg)
                         .ok_or_else(|| ASN1Error::new(ASN1ErrorKind::Invalid))
                         .unwrap(),
                 )
@@ -641,7 +868,7 @@ impl PFX {
                 .write(w.next());
             });
         });
-        let mac_data = MacData::new(&contents, &password);
+        let mac_data = MacData::new(&contents, &password, algorithm, hmac);
         Some(PFX {
             version: 3,
             auth_safe: ContentInfo::Data(contents),
@@ -949,10 +1176,12 @@ pub struct EncryptedPrivateKeyInfo {
 impl EncryptedPrivateKeyInfo {
     pub fn parse(r: BERReader) -> Result<Self, ASN1Error> {
         r.read_sequence(|r| {
+            println!("Attempting to read encryptedprivatekeyinfo");
             let encryption_algorithm = AlgorithmIdentifier::parse(r.next())?;
+            println!("Attempting to read encryptedprivatekeyinfo2");
 
             let encrypted_data = r.next().read_bytes()?;
-
+            println!("Attempting to read encryptedprivatekeyinfo3");
             Ok(EncryptedPrivateKeyInfo {
                 encryption_algorithm,
                 encrypted_data,
